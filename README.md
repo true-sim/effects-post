@@ -209,6 +209,43 @@ own, named as it (`on` or `off`: a rebuild, as it provides a new image). Its tex
 by a PNG mask loaded through the asset cache; ordering and switching off (the scene, not an unwritten image); a damage
 vignette in display light; heat haze through a normal map where the scene is near, and scrolling with its clock.
 
+## Benchmark
+
+On an RX 9070 XT (2026-11-08, `PostBenchmark`, `TRUESIM_BENCHMARK=true`, without JaCoCo's agent: the house in the
+sun, shading, shadows, sky and the display transform with its display stage, every post effect off but the one
+measured), the median of 300 frames after 120: the technique's own passes (their GPU timestamps summed) and the
+frame's GPU span. The span varies by about 0.1 ms at 1080p and 0.3 ms at 4K between rows (the first row's included),
+more than the cheaper effects add: their own times are the measure.
+
+| Technique | 1920 x 1080: own ms | frame ms | 3840 x 2160: own ms | frame ms |
+|---|---|---|---|---|
+| off (no post effect) | 0 | 0.515 | 0 | 2.421 |
+| exposure: off (display.exposure) | 0.004 | 0.501 | 0.005 | 2.423 |
+| exposure: histogram | 0.061 | 0.452 | 0.265 | 2.647 |
+| exposure: average | 0.040 | 0.435 | 0.293 | 2.673 |
+| grading: baked (32) | 0.038 | 0.440 | 0.146 | 2.564 |
+| grading: baked (64) | 0.046 | 0.450 | 0.195 | 2.624 |
+| grading: direct | 0.024 | 0.423 | 0.139 | 2.529 |
+| grading: direct, .cube table | 0.048 | 0.451 | 0.193 | 2.584 |
+| dof: gather (radius 24) | 0.280 | 0.674 | 1.574 | 3.386 |
+| dof: gather (radius 48) | 0.282 | 0.676 | 1.705 | 3.583 |
+| dof: gaussian (radius 24) | 0.084 | 0.482 | 0.620 | 3.069 |
+| lens: distortion | 0.024 | 0.424 | 0.279 | 2.624 |
+| lens: aberration radial | 0.027 | 0.424 | 0.311 | 2.650 |
+| lens: aberration spectral | 0.054 | 0.450 | 0.432 | 2.755 |
+| lens: vignette natural | 0.022 | 0.419 | 0.311 | 3.046 |
+| lens: all three (spectral, artistic) | 0.056 | 0.453 | 0.463 | 2.888 |
+| flash: display | 0.016 | 0.423 | 0.173 | 2.590 |
+| flash: scene | 0.016 | 0.412 | 0.111 | 2.519 |
+| grain: film | 0.047 | 0.446 | 0.303 | 3.040 |
+| material: wipe | 0.026 | 0.428 | 0.331 | 2.595 |
+| material: heat haze | 0.034 | 0.431 | 0.442 | 2.977 |
+
+Every technique here passes its tests, so all are kept. Grading `direct` is the cheaper without a table (its
+operations are few); `baked` costs the same whatever is graded, the table included, and is the cheaper with one at 4K;
+both stay, `baked` the default for its fixed cost. Depth of field's gather costs about three times the Gaussian for
+its bokeh and near field over edges.
+
 ## Held back
 
 The color vision filters of the bloom-and-tone branch (Machado 2009 simulation, Fidaner 2005 daltonizing) wait for the
