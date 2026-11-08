@@ -127,6 +127,9 @@ public final class Bloom implements Technique {
      * @param coronaGreen its green
      * @param coronaBlue its blue
      * @param spread chromatic spread: 1 scales each channel's kernel by its wavelength (610, 550, 465 nm)
+     * @param kernel an image kernel's asset path (a texture: PNG, Radiance HDR), loaded through {@link PostTextures};
+     *     empty: the procedural kernel (also while the image loads)
+     * @param kernelSize the image kernel's width, a share of the screen's long side
      */
     public record Convolution(
         @Tunable(value = "the share of bloom mixed into the scene's light", min = 0, max = 1) float intensity,
@@ -164,7 +167,10 @@ public final class Bloom implements Technique {
         @Tunable(value = "the corona's green", min = 0, max = 1) float coronaGreen,
         @Tunable(value = "the corona's blue", min = 0, max = 1) float coronaBlue,
         @Tunable(value = "the convolution kernel's chromatic spread: 1 scales each channel by its wavelength",
-            min = 0, max = 1) float spread) implements TechniqueConfig {
+            min = 0, max = 1) float spread,
+        @Tunable("an image kernel's asset path (a texture), or empty for the procedural kernel") String kernel,
+        @Tunable(value = "the image kernel's width, a share of the screen's long side", min = 0.01, max = 1)
+        float kernelSize) implements TechniqueConfig {
     }
 
     /** Jimenez's 13-tap chain, the default. */
@@ -182,15 +188,35 @@ public final class Bloom implements Technique {
     /** Convolution with a lens' point spread function through FFTs. */
     public static final TechniqueKind<Convolution, Bloom, Technique> FFT = TechniqueKind.of(SLOT, "fft",
         new Convolution(0.05f, 512, 0, 6, 1, 0, 0.5f, true, 6, 0, 0.004f, 0.25f, 0.0015f, 3, 0.25f, 0.04f, 0.006f,
-            0.1f, 1, 0.8f, 0.6f, 0.5f),
+            0.1f, 1, 0.8f, 0.6f, 0.5f, "", 0.5f),
         "convolution with a lens' diffraction spikes and corona through 2D FFTs",
-        (bloom, config) -> new Convolved(config));
+        (bloom, config) -> bloom.new Convolved(config));
 
     private static final int NONE = -1;
     private static final String SHADER = "shaders/post/bloom.spv";
     private static final String FFT_SHADER = "shaders/post/fft.spv";
 
     private final Map<TechniqueKind<?, ?, ?>, Technique> made = new IdentityHashMap<>(); // per kind, once chosen
+    private final PostTextures.Held kernelImage; // the convolution's image kernel, or null: none
+
+    /** Bloom by the settings, the convolution's kernels procedural (an image kernel's path is ignored). */
+    public Bloom() {
+        kernelImage = null;
+    }
+
+    /** Bloom by the settings, the convolution's image kernels loaded through {@code textures}. */
+    public Bloom(PostTextures textures) {
+        kernelImage = textures.held();
+    }
+
+    /**
+     * The image kernel's slot, plus one (0: none): the graph rebuilds when it changes, making the kernel's spectrum
+     * anew once the image has loaded. Allocates nothing.
+     */
+    @Override
+    public long buildVersion() {
+        return kernelImage == null ? 0 : kernelImage.slot() + 1;
+    }
 
     /**
      * Registers its settings in {@code registry} for discovery: the slot, its kinds' tunables with it, hidden. An
@@ -427,7 +453,12 @@ public final class Bloom implements Technique {
     }
 
     /** The convolution bloom, with the physical chain under it where its share is above 0. */
-    private record Convolved(Supplier<Convolution> config) implements Technique {
+    private final class Convolved implements Technique {
+        private final Supplier<Convolution> config;
+
+        Convolved(Supplier<Convolution> config) {
+            this.config = config;
+        }
 
         @Override
         public List<Key<?>> provides() {
@@ -465,7 +496,7 @@ public final class Bloom implements Technique {
      * image, made anew when they change).
      */
     @AllowAllocation("building the graph, when it changes")
-    private static Image convolve(GraphBuilder g, Image scene) {
+    private Image convolve(GraphBuilder g, Image scene) {
         int n = Integer.highestOneBit(Bloom.<Integer>fft(g, "size"));
         int log2n = Integer.numberOfTrailingZeros(n);
         float texels = n / 2f; // the screen's long side
@@ -483,8 +514,13 @@ public final class Bloom implements Technique {
         float red = fft(g, "coronaRed");
         float green = fft(g, "coronaGreen");
         float blue = fft(g, "coronaBlue");
-        String kernel = java.util.Arrays.toString(new float[] {blades, rotation, core, spikeLength, spikeWidth,
-            spikeFalloff, spikes, coronaRadius, coronaWidth, corona, spread, red, green, blue});
+        String path = fft(g, "kernel");
+        float imageTexels = Bloom.<Float>fft(g, "kernelSize") * texels;
+        // An image kernel once loaded (buildVersion rebuilds then); procedural before, or without one
+        int image = kernelImage == null ? NONE : kernelImage.follow(path).slot();
+        String kernel = image != NONE ? "image " + path + " " + image + " " + imageTexels
+            : java.util.Arrays.toString(new float[] {blades, rotation, core, spikeLength, spikeWidth, spikeFalloff,
+                spikes, coronaRadius, coronaWidth, corona, spread, red, green, blue});
         ImageDesc desc = ImageDesc.of(Format.R32G32B32A32_SFLOAT, n, n);
         Image spectrum = g.persistent("bloom kernel spectrum " + n + " " + kernel, desc);
         Image spectrumBlue = g.persistent("bloom kernel spectrum, blue, " + n + " " + kernel, desc);
@@ -501,7 +537,7 @@ public final class Bloom implements Technique {
         FftPush kernelPush = new FftPush().n(n).log2n(log2n).blades(blades).rotation(rotation).core(core)
             .spikeLength(spikeLength).spikeWidth(spikeWidth).spikeFalloff(spikeFalloff).spikes(spikes)
             .coronaRadius(coronaRadius).coronaWidth(coronaWidth).corona(corona).spread(spread)
-            .coronaRed(red).coronaGreen(green).coronaBlue(blue);
+            .coronaRed(red).coronaGreen(green).coronaBlue(blue).kernelImage(image).imageTexels(imageTexels);
         // (each reads the spectrum, to ask whether it is new)
         g.pass("bloom kernel").read(spectrum, Access.SAMPLED_COMPUTE).write(scratch, Access.STORAGE_WRITE)
             .record(ctx -> {

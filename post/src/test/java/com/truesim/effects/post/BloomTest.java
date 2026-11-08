@@ -250,6 +250,43 @@ class BloomTest {
     }
 
     @Test
+    void anImageKernelLoadsAsATextureAssetAndShapesTheBloom() throws java.io.IOException {
+        // A kernel image of a horizontal streak, 64 texels wide and 1 high in a 64 x 64 PNG: a point of light blooms
+        // into a horizontal line (the kernel's width a quarter of the screen: 64 of 256 pixels), keeping its light.
+        java.awt.image.BufferedImage streak = new java.awt.image.BufferedImage(64, 64,
+            java.awt.image.BufferedImage.TYPE_INT_ARGB);
+        for (int x = 0; x < 64; x++) {
+            streak.setRGB(x, 32, 0xffffffff);
+        }
+        java.io.ByteArrayOutputStream png = new java.io.ByteArrayOutputStream();
+        javax.imageio.ImageIO.write(streak, "png", png);
+        try (PostAssetsFixture assets = new PostAssetsFixture(gpu.device)) {
+            assets.files.put("lenses/streak.png", png.toByteArray());
+            String path = "test://lenses/streak.png#linear";
+            PostTextures.Held loading = assets.post.held().follow(path);
+            assets.load(loading);
+            float[] out = gpu.render(SIZE, SIZE, (x, y, w, h, rgb) -> {
+                float v = x == 128 && y == 128 ? 1000 : 0;
+                rgb[0] = v;
+                rgb[1] = v;
+                rgb[2] = v;
+            }, (graph, port) -> {
+                Bloom.SLOT.choose(graph.settings(), Bloom.FFT);
+                set(graph.settings(), Bloom.FFT, "intensity", 1f);
+                set(graph.settings(), Bloom.FFT, "kernel", path);
+                set(graph.settings(), Bloom.FFT, "kernelSize", 0.25f);
+                port.add(new Bloom(assets.post));
+            }, 1);
+            assertThat(sum(out, 1)).as("energy kept").isCloseTo(1000, within(10.0));
+            assertThat(at(out, 128 + 20, 128)).as("along the streak").isGreaterThan(5);
+            assertThat(at(out, 128, 128 + 20)).as("across it: nothing").isLessThan(at(out, 128 + 20, 128) / 100);
+            assertThat(at(out, 128 + 40, 128)).as("beyond its half width (32): nothing")
+                .isLessThan(at(out, 128 + 20, 128) / 100);
+            loading.release();
+        }
+    }
+
+    @Test
     void theConvolutionMixesInThePhysicalChainsGlowByItsShare() {
         PostFixture.Pattern pattern = BloomTest::square;
         float[] chain = gpu.render(SIZE, SIZE, pattern, (graph, port) -> {
