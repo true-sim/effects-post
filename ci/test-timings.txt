@@ -1,0 +1,3 @@
+# Seconds each test class (each test of the classes over 4 minutes) took on CI's software GPU (Mesa lavapipe,
+# a 4-core runner), by module: what the test shards balance (ci.yml, -Ptruesim.shard=i/n). Tests missing here
+# go to a shard by their class name's hash. Refresh from a run's reports artifact with ci/timings.py.

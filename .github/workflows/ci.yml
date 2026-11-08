@@ -1,0 +1,173 @@
+name: CI
+
+# Tests run on pull requests only: main gets exactly a tested, up-to-date PR (release.sh merges only those), so a
+# push to main only compiles, to keep the Gradle cache that pull requests read warm.
+#
+# The GPU tests render on Mesa's lavapipe (a CPU Vulkan device) and take most of the time, so the long modules' tests
+# (SHARD_MODULES) run in SHARDS parallel jobs, balanced by ci/test-timings.txt (-Ptruesim.shard=i/n); `modules` builds
+# and checks everything else. The required check is the last job, `build`: it fails if any job failed, and checks the
+# sharded modules' coverage from every shard's data together.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read # build-logic plugins and libraries from GitHub Packages
+
+env:
+  SHARD_MODULES: effects-post
+  SHARDS: 4 # keep in step with the matrix below
+  GITHUB_ACTOR: ${{ github.actor }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-26.04
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Only Markdown changed (docs): the required check passes without building. Any doubt builds.
+      - id: changes
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if files=$(git diff --name-only "$BASE" HEAD 2>/dev/null) && [ -n "$files" ] && ! echo "$files" | grep -qv '\.md$'; then
+            echo "Only Markdown changed, build skipped:"; echo "$files"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  modules:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned Mesa lavapipe and validation layer, offscreen SDL; tests must run validated.
+      - uses: true-sim/build-logic/.github/actions/setup-vulkan@61314fb2c79472f89f95c8ffd001ee53e904b02a # main, 2026-10-27
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 27
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Build (main) or build and check all but the sharded tests (pull requests, manual runs)
+        run: |
+          if [ "${{ github.event_name }}" = push ]; then
+            ./gradlew assemble testClasses
+          else
+            skip=()
+            for module in ${SHARD_MODULES//,/ }; do
+              skip+=(-x ":$module:test" -x ":$module:jacocoTestCoverageVerification")
+            done
+            ./gradlew build "${skip[@]}"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: reports-modules
+          path: |
+            */build/reports
+            */build/test-results
+
+  shard:
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'push'
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      # lavapipe compiles shaders through LLVM, minutes for the largest; its disk cache keeps them for this PR's reruns
+      MESA_SHADER_CACHE_DIR: ${{ github.workspace }}/.mesa-shader-cache
+      MESA_SHADER_CACHE_MAX_SIZE: 4G
+    steps:
+      - uses: actions/checkout@v7
+      - uses: true-sim/build-logic/.github/actions/setup-vulkan@61314fb2c79472f89f95c8ffd001ee53e904b02a # main, 2026-10-27
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 27
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/cache@v6
+        with:
+          path: .mesa-shader-cache
+          key: mesa-shaders-${{ matrix.shard }}-${{ github.sha }}
+          restore-keys: mesa-shaders-${{ matrix.shard }}-
+      - name: Tests of shard ${{ matrix.shard }}
+        run: |
+          tasks=()
+          for module in ${SHARD_MODULES//,/ }; do
+            tasks+=(":$module:test")
+          done
+          ./gradlew "${tasks[@]}" -Ptruesim.shard=${{ matrix.shard }}/$SHARDS -Ptruesim.shardModules=$SHARD_MODULES
+      - name: Coverage data, named by shard
+        if: always()
+        run: |
+          for exec in */build/jacoco/test.exec; do
+            [ -f "$exec" ] && mv "$exec" "${exec%test.exec}shard-${{ matrix.shard }}.exec"
+          done
+          true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage-${{ matrix.shard }}
+          path: '*/build/jacoco/shard-*.exec'
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: reports-shard-${{ matrix.shard }}
+          path: |
+            */build/reports
+            */build/test-results
+            */hs_err_pid*.log
+
+  build:
+    needs: [changes, modules, shard]
+    if: always()
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Every job passed (or had nothing to do)
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "changes, modules, shards: $RESULTS"
+          for result in $RESULTS; do
+            if [ "$result" != success ] && [ "$result" != skipped ]; then
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@v7
+        if: needs.shard.result == 'success'
+      - uses: actions/setup-java@v6
+        if: needs.shard.result == 'success'
+        with:
+          distribution: temurin
+          java-version: 27
+      - uses: gradle/actions/setup-gradle@v6
+        if: needs.shard.result == 'success'
+      - uses: actions/download-artifact@v8
+        if: needs.shard.result == 'success'
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+      - name: The sharded modules' coverage, from every shard's data
+        if: needs.shard.result == 'success'
+        run: |
+          tasks=()
+          for module in ${SHARD_MODULES//,/ }; do
+            tasks+=(":$module:jacocoTestCoverageVerification" ":$module:jacocoTestReport" -x ":$module:test")
+          done
+          ./gradlew "${tasks[@]}" -Ptruesim.mergedCoverage=true
+      - uses: actions/upload-artifact@v7
+        if: always() && needs.shard.result == 'success'
+        with:
+          name: reports-coverage
+          path: '*/build/reports/jacoco'
