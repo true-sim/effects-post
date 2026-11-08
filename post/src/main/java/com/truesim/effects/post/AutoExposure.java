@@ -309,8 +309,11 @@ public final class AutoExposure implements Technique {
             Image scene = g.require(Keys.SCENE_COLOR);
             int groups = ((scene.width() + 15) / 16) * ((scene.height() + 15) / 16);
             Buffer measure = g.createBuffer("exposure measure", mode == MODE_HISTOGRAM ? 256 * 4L : groups * 8L);
-            Pipeline measuring = g.computeProgram(SHADER, "measureMain", ExposurePush.BYTES);
-            Pipeline adapting = g.computeProgram(SHADER, "adaptMain", ExposurePush.BYTES);
+            boolean histogram = mode == MODE_HISTOGRAM;
+            Pipeline measuring = g.computeProgram(SHADER, histogram ? "histogramMain" : "averageMain",
+                ExposurePush.BYTES);
+            Pipeline adapting = g.computeProgram(SHADER, histogram ? "adaptHistogramMain" : "adaptAverageMain",
+                ExposurePush.BYTES);
             ExposurePush measurePush = new ExposurePush().mode(mode);
             ExposurePush adaptPush = new ExposurePush().mode(mode);
             if (mode == MODE_HISTOGRAM) {

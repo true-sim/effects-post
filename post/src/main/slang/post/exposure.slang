@@ -9,12 +9,15 @@
 // - HISTOGRAM: 256 bins of log2 luminance; the average over the pixels between the low and high shares of them (the
 //   darkest and the brightest left out: a black sky, the sun, a lamp).
 // - AVERAGE: the log average (geometric mean) of every pixel's luminance.
+// Each mode has entry points of its own: with one shader for both (the histogram's path returning before the barriers
+// of the average's), lavapipe's compute threads crashed (an access violation) on every histogram frame, even with
+// that path emptied; the cause inside lavapipe was not found (docs/pitfalls.md).
 import bindless;
 
 struct ExposurePush
 {
     uint source;        // sampled slot of the scene color
-    uint mode;          // MODE_*
+    uint mode;          // MODE_* (the entry points are the modes'; kept for the layout)
     uint2 size;         // the render region
     uint* bins;         // HISTOGRAM: 256 counts; AVERAGE: a float sum and a count per workgroup
     float* state;       // [0] the factor scene color is multiplied by; [1] the kept exposure, log2 per cd/mÂ²; [2] 1 once
@@ -69,27 +72,33 @@ float logOf(uint b)
     return push.minLog + (b - 1) / 254.0 * (push.maxLog - push.minLog);
 }
 
+/** HISTOGRAM: each pixel of the region counted in its bin, per workgroup in shared memory, then into the buffer. */
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void measureMain(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex, uint3 group : SV_GroupID)
+void histogramMain(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
 {
     bool inside = all(id.xy < push.size);
     float l = inside ? luminance(max(textures[push.source].Load(int3(id.xy, 0)).rgb, 0)) : 0;
-    if (push.mode == MODE_HISTOGRAM)
+    counts[index] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    if (inside)
     {
-        counts[index] = 0;
-        GroupMemoryBarrierWithGroupSync();
-        if (inside)
-        {
-            InterlockedAdd(counts[binOf(l)], 1);
-        }
-        GroupMemoryBarrierWithGroupSync();
-        if (counts[index] != 0)
-        {
-            InterlockedAdd(push.bins[index], counts[index]);
-        }
-        return;
+        InterlockedAdd(counts[binOf(l)], 1);
     }
+    GroupMemoryBarrierWithGroupSync();
+    if (counts[index] != 0)
+    {
+        InterlockedAdd(push.bins[index], counts[index]);
+    }
+}
+
+/** AVERAGE: the sum of each workgroup's log2 luminances and its pixel count. */
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void averageMain(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex, uint3 group : SV_GroupID)
+{
+    bool inside = all(id.xy < push.size);
+    float l = inside ? luminance(max(textures[push.source].Load(int3(id.xy, 0)).rgb, 0)) : 0;
     sums[index] = inside ? clamp(log2(max(l, 1e-30)), push.minLog, push.maxLog) : 0;
     GroupMemoryBarrierWithGroupSync();
     for (uint stride = 128; stride > 0; stride >>= 1)
@@ -114,70 +123,13 @@ float krawczyk(float luminance)
     return 1.03 - 2 / (2 + log10(max(luminance, 0) + 1));
 }
 
-/** The exposure for this frame, from the measure, adapted from the last: one workgroup of 256. */
-[shader("compute")]
-[numthreads(256, 1, 1)]
-void adaptMain(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
+/** The exposure for this frame from the average log2 luminance `average` (scene units), adapted from the last. */
+void adapt(float average)
 {
-    float average; // log2 luminance, scene units
-    if (push.mode == MODE_HISTOGRAM)
-    {
-        if (index != 0)
-        {
-            return;
-        }
-        uint total = 0;
-        for (uint b = 0; b < BINS; b++)
-        {
-            total += push.bins[b];
-        }
-        // The pixels between the low and high shares of the sorted luminances, each bin's part of them.
-        float from = push.low * total;
-        float to = push.high * total;
-        float below = 0;
-        float sum = 0;
-        float count = 0;
-        for (uint b = 0; b < BINS; b++)
-        {
-            float n = push.bins[b];
-            float kept = max(min(below + n, to) - max(below, from), 0);
-            sum += kept * (b == 0 ? push.minLog : logOf(b));
-            count += kept;
-            below += n;
-        }
-        average = count > 0 ? sum / count : push.minLog;
-    }
-    else
-    {
-        float sum = 0;
-        uint count = 0;
-        for (uint g = index; g < push.groups; g += 256)
-        {
-            sum += asfloat(push.bins[2 * g]);
-            count += push.bins[2 * g + 1];
-        }
-        sums[index] = sum;
-        counts[index] = count;
-        GroupMemoryBarrierWithGroupSync();
-        for (uint stride = 128; stride > 0; stride >>= 1)
-        {
-            if (index < stride)
-            {
-                sums[index] += sums[index + stride];
-                counts[index] += counts[index + stride];
-            }
-            GroupMemoryBarrierWithGroupSync();
-        }
-        if (index != 0)
-        {
-            return;
-        }
-        average = counts[0] > 0 ? sums[0] / counts[0] : push.minLog;
-    }
     float units = log2(push.scale);
-    float absolute = average + units; // log2 cd/mÂ²
+    float absolute = average + units; // log2 cd/m²
     float key = push.key == KEY_KRAWCZYK ? max(krawczyk(exp2(absolute)), 1e-3) : push.keyValue;
-    // Exposure per cd/mÂ²: key / L, in stops
+    // Exposure per cd/m²: key / L, in stops
     float target = clamp(log2(key) - absolute + push.compensation, push.minEv, push.maxEv);
     float kept = push.state[1];
     float speed = target > kept ? push.up : push.down;
@@ -187,4 +139,61 @@ void adaptMain(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
     push.state[1] = ev;
     push.state[2] = 1;
     push.state[3] = target;
+}
+
+/** HISTOGRAM: the average between the low and high shares of the sorted luminances, adapted to. One thread. */
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void adaptHistogramMain(uint3 id : SV_DispatchThreadID)
+{
+    uint total = 0;
+    for (uint b = 0; b < BINS; b++)
+    {
+        total += push.bins[b];
+    }
+    // The pixels between the low and high shares of the sorted luminances, each bin's part of them.
+    float from = push.low * total;
+    float to = push.high * total;
+    float below = 0;
+    float sum = 0;
+    float count = 0;
+    for (uint b = 0; b < BINS; b++)
+    {
+        float n = push.bins[b];
+        float kept = max(min(below + n, to) - max(below, from), 0);
+        sum += kept * (b == 0 ? push.minLog : logOf(b));
+        count += kept;
+        below += n;
+    }
+    adapt(count > 0 ? sum / count : push.minLog);
+}
+
+/** AVERAGE: the workgroups' sums added up, their log average adapted to. One workgroup of 256. */
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void adaptAverageMain(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
+{
+    float sum = 0;
+    uint count = 0;
+    for (uint g = index; g < push.groups; g += 256)
+    {
+        sum += asfloat(push.bins[2 * g]);
+        count += push.bins[2 * g + 1];
+    }
+    sums[index] = sum;
+    counts[index] = count;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128; stride > 0; stride >>= 1)
+    {
+        if (index < stride)
+        {
+            sums[index] += sums[index + stride];
+            counts[index] += counts[index + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (index == 0)
+    {
+        adapt(counts[0] > 0 ? sums[0] / counts[0] : push.minLog);
+    }
 }

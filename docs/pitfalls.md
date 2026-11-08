@@ -45,3 +45,17 @@ foreground's texel: a dark fringe of 0.75 where the background was 1.
   kinds pass at even and odd edges. The branch had no such test; this one's first version began two pixels from the
   edge and passed with the fault.
 - Rule: halo tests start at the edge pixel itself, with edges on and between the half-resolution texels.
+
+## Lavapipe
+
+**One compute shader for two modes crashed lavapipe on one of them; its cause was not found.** Auto exposure's
+`measureMain` and `adaptMain` served both the histogram and the log average, branching on a push constant: every frame
+of the histogram crashed the test JVM in lavapipe's compute threads (SIGSEGV on CI's Linux runners, an access
+violation on Windows' Mesa 26.2.6), with each histogram path emptied in turn and with the clear pass and the buffer's
+size made the average's; the average ran. An observation, not a cause: the histogram path returned before the
+average's barriers (uniformly, by the push constant).
+- Proof: CI run 42468640123 of true-sim/effects-post#2, shard 1, twice; `AutoExposureTest` on the local lavapipe
+  crashed in every histogram test and passed with entry points of their own per mode (`histogramMain`,
+  `adaptHistogramMain`, `averageMain`, `adaptAverageMain`).
+- Rule: give each mode of a compute shader that uses barriers an entry point of its own; run new shaders on the local
+  lavapipe before CI.
