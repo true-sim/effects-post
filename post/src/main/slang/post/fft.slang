@@ -38,7 +38,11 @@ struct FftPush
     float coronaRed;    // the corona's color
     float coronaGreen;
     float coronaBlue;
+    uint kernelImage;   // kernel: sampled slot of an image kernel (a texture asset), or NONE (procedural)
+    float imageTexels;  // the FFT texels the image's width spans
 };
+
+static const uint NONE = 0xffffffffu;
 
 [[vk::push_constant]]
 ConstantBuffer<FftPush> push;
@@ -180,10 +184,28 @@ void kernelMain(uint3 id : SV_DispatchThreadID)
         return;
     }
     float2 p = centered(id.xy);
-    // Diffraction scales with wavelength: red (610 nm) wider than green (550), blue (465) narrower.
-    float3 stretch = 1 + push.spread * (float3(610, 550, 465) / 550 - 1);
-    float3 k = float3(procedural(p, stretch.r, push.coronaRed), procedural(p, stretch.g, push.coronaGreen),
-        procedural(p, stretch.b, push.coronaBlue));
+    float3 k;
+    if (push.kernelImage != NONE)
+    {
+        // The image's center at (0, 0): from the mip level matching the FFT's texels (no aliasing of fine spikes),
+        // nothing beyond its edges. Its light's sum does not matter: the spectrum is divided by it.
+        uint width;
+        uint height;
+        uint levels;
+        textures[push.kernelImage].GetDimensions(0, width, height, levels);
+        float scale = push.imageTexels / width; // FFT texels per image texel
+        float2 uv = (p / scale + float2(width, height) * 0.5) / float2(width, height);
+        bool inside = all(uv >= 0) && all(uv <= 1);
+        float lod = max(log2(1 / scale), 0);
+        k = inside ? max(textures[push.kernelImage].SampleLevel(samplers[LINEAR_CLAMP], uv, lod).rgb, 0) : 0;
+    }
+    else
+    {
+        // Diffraction scales with wavelength: red (610 nm) wider than green (550), blue (465) narrower.
+        float3 stretch = 1 + push.spread * (float3(610, 550, 465) / 550 - 1);
+        k = float3(procedural(p, stretch.r, push.coronaRed), procedural(p, stretch.g, push.coronaGreen),
+            procedural(p, stretch.b, push.coronaBlue));
+    }
     images[push.image][id.xy] = float4(k.r, k.g, k.b, 0);
 }
 
