@@ -325,6 +325,38 @@ float4 fieldAt(uint slot, uint2 p)
 }
 
 /**
+ * The far field at full resolution pixel `p` whose own far circle is `circle` (half resolution pixels): bilinear over
+ * the four texels around, each weighted by how alike its circle is (a bilateral upsample), so a sharp foreground's
+ * texels do not reach into the blurred background beside it, nor the background's into the foreground (measured: a
+ * quarter of the dark foreground on the background's first pixel, bilinear). Plain bilinear where none is alike.
+ */
+float4 farAt(uint slot, uint2 p, float circle)
+{
+    uint width;
+    uint height;
+    textures[slot].GetDimensions(width, height);
+    uint fullWidth;
+    uint fullHeight;
+    images[push.target].GetDimensions(fullWidth, fullHeight);
+    float2 at = clamp((float2(p) + 0.5) / float2(fullWidth, fullHeight) * float2(width, height), 0.5,
+        float2(push.sourceRegion) - 0.5) - 0.5;
+    int2 a = int2(floor(at));
+    float2 t = at - a;
+    float4 sum = 0;
+    float weights = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        int2 o = int2(i & 1, i >> 1);
+        float4 texel = textures[slot].Load(int3(clamp(a + o, 0, int2(push.sourceRegion) - 1), 0));
+        float bilinear = (o.x == 1 ? t.x : 1 - t.x) * (o.y == 1 ? t.y : 1 - t.y);
+        float alike = saturate(1 - abs(abs(texel.a) - circle) / max(circle * 0.5, 0.5));
+        sum += texel * bilinear * alike;
+        weights += bilinear * alike;
+    }
+    return weights > 1e-4 ? sum / weights : fieldAt(slot, p);
+}
+
+/**
  * The scene color, in place: the blurred far field over the sharp pixels by their circle (fully blurred past 1.5
  * pixels), the near field over it by its coverage (GATHER).
  */
@@ -338,7 +370,7 @@ void compositeMain(uint3 id : SV_DispatchThreadID)
     }
     float4 sharp = images[push.target][id.xy];
     float circle = textures[push.coc].Load(int3(id.xy, 0)).r;
-    float4 far = fieldAt(push.aux, id.xy);
+    float4 far = farAt(push.aux, id.xy, max(push.mode == MODE_GATHER ? circle : abs(circle), 0) * 0.5);
     float3 color = lerp(sharp.rgb, far.rgb, saturate(abs(push.mode == MODE_GATHER ? max(circle, 0) : circle) - 0.5));
     if (push.mode == MODE_GATHER)
     {

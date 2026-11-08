@@ -175,24 +175,27 @@ class DepthOfFieldTest {
     void aSharpForegroundGetsNoHaloFromTheBlurredBackground() {
         // A dark square in focus at 0.5 m in front of a bright background far behind (10 m) and blurred: the
         // background's blur must not spread over the square (no bright halo inside its edge), and the square's dark
-        // must not spread into the background (no dark halo around it) beyond the composite's one pixel.
-        PostFixture.Pattern square = (x, y, w, h, out) -> {
-            float v = x >= 96 && x < 160 && y >= 96 && y < 160 ? 0 : 1;
-            out[0] = v;
-            out[1] = v;
-            out[2] = v;
-        };
-        PostFixture.Depth depth = (x, y, w, h) -> x >= 96 && x < 160 && y >= 96 && y < 160 ? depthAt(0.5)
-            : depthAt(10);
+        // must not spread into the background (no dark halo around it), its edges at even and odd pixels (across the
+        // half resolution fields' texels or between them).
         double radius = DepthOfField.circleOfConfusion(10, 0.5, focal(), 0.7, 0.024, SIZE);
         assertThat(radius).isGreaterThan(5);
-        for (TechniqueKind<?, DepthOfField, Technique> kind : KINDS) {
-            float[] out = render(kind, 0.7f, 0.5f, square, depth);
-            for (int d = 2; d < 20; d++) {
-                assertThat(at(out, 96 + d, 128)).as(kind.id() + ": inside the sharp square, " + d + " from its edge")
-                    .isLessThan(0.02f);
-                assertThat(at(out, 95 - d, 128)).as(kind.id() + ": the background, " + d + " from the square")
-                    .isGreaterThan(0.98f);
+        for (int edge : new int[] {96, 97}) {
+            PostFixture.Pattern square = (x, y, w, h, out) -> {
+                float v = x >= edge && x < 160 && y >= 96 && y < 160 ? 0 : 1;
+                out[0] = v;
+                out[1] = v;
+                out[2] = v;
+            };
+            PostFixture.Depth depth = (x, y, w, h) -> x >= edge && x < 160 && y >= 96 && y < 160 ? depthAt(0.5)
+                : depthAt(10);
+            for (TechniqueKind<?, DepthOfField, Technique> kind : KINDS) {
+                float[] out = render(kind, 0.7f, 0.5f, square, depth);
+                for (int d = 0; d < 20; d++) {
+                    assertThat(at(out, edge + d, 128)).as(kind.id() + ", edge " + edge + ": inside the sharp square, "
+                        + d + " from its edge").isLessThan(0.02f);
+                    assertThat(at(out, edge - 1 - d, 128)).as(kind.id() + ", edge " + edge + ": the background, " + d
+                        + " from the square").isGreaterThan(0.98f);
+                }
             }
         }
     }
